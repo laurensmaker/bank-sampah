@@ -99,7 +99,7 @@ class DatabaseSeeder extends Seeder
         }
 
         // Buat data armada
-         DB::table('armada')->insert([
+        DB::table('armada')->insert([
             [
                 'nama_armada' => 'Armada 1',
                 'email' => 'armada1@bank.com',
