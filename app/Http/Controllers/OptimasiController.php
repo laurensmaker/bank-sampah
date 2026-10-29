@@ -13,14 +13,14 @@ use Illuminate\Support\Facades\Log;
 
 class OptimasiController extends Controller
 {
-    protected $mtsp;
-    protected $nn;
+    // protected $mtsp;
+    // protected $nn;
 
-    public function __construct(MTSPService $mtsp, NearestNeighborService $nn)
-    {
-        $this->mtsp = $mtsp;
-        $this->nn   = $nn;
-    }
+    // public function __construct(MTSPService $mtsp, NearestNeighborService $nn)
+    // {
+    //     $this->mtsp = $mtsp;
+    //     $this->nn   = $nn;
+    // }
 
     // ─────────────────────────────────────────────────────────────
     //  INDEX — Halaman utama, tampilkan optimasi terakhir
@@ -49,73 +49,23 @@ class OptimasiController extends Controller
     // ─────────────────────────────────────────────────────────────
     //  PROSES — Jalankan MTSP + Nearest Neighbor (AJAX)
     // ─────────────────────────────────────────────────────────────
-    public function proses()
+   
+
+    public function proses(Request $request, PenjemputanService $service)
     {
         try {
-            Log::info('OptimasiController: Memulai proses optimasi');
+            $hasil = $service->proses();
 
-            // Cek dulu apakah ada permintaan menunggu
-            $adaPermintaan = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
-                $q->where('status', 'Menunggu');
-            })->exists();
-
-            if (!$adaPermintaan) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Tidak ada permintaan dengan status Menunggu.'
-                ]);
+            if ($hasil->optimasi === null) {
+                return back()->with('warning', $hasil->pesan);
             }
 
-            // Cek apakah ada armada aktif (minimal 2)
-            $adaArmada = Armada::where('status_armada', 'Aktif')->count();
-
-            if ($adaArmada < 2) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Minimal diperlukan 2 armada aktif yang tersedia.'
-                ]);
-            }
-
-            // Langkah 1: Bagi permintaan ke armada (MTSP)
-            $result = $this->mtsp->proses();
-
-            if (!$result || !isset($result->optimasi)) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Gagal memproses pembagian rute.'
-                ]);
-            }
-
-            // Langkah 2: Urutkan rute tiap armada (Nearest Neighbor)
-            $this->nn->proses($result->optimasi->id);
-
-            Log::info('Optimasi berhasil', [
-                'optimasi_id' => $result->optimasi->id,
-                'jumlah_permintaan' => $result->optimasi->jumlah_permintaan,
-                'jumlah_armada' => $result->optimasi->jumlah_armada
-            ]);
-
-            return response()->json([
-                'success' => true,
-                'message' => $result->pesan ?? 'Optimasi rute berhasil!',
-                'redirect' => route('armada.rute'),
-                'data' => [
-                    'optimasi_id' => $result->optimasi->id,
-                    'jumlah_permintaan' => $result->optimasi->jumlah_permintaan,
-                    'jumlah_armada' => $result->optimasi->jumlah_armada,
-                    'total_berat' => $result->optimasi->total_berat
-                ]
-            ]);
+            return redirect()
+                ->route('optimasi.detail', $hasil->optimasi->id)
+                ->with('success', $hasil->pesan);
 
         } catch (\Exception $e) {
-            Log::error('Error optimasi: ' . $e->getMessage(), [
-                'trace' => $e->getTraceAsString()
-            ]);
-
-            return response()->json([
-                'success' => false,
-                'message' => 'Gagal melakukan optimasi: ' . $e->getMessage()
-            ]);
+            return back()->with('error', 'Gagal memproses: ' . $e->getMessage());
         }
     }
 

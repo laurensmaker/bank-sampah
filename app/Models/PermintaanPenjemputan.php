@@ -51,8 +51,7 @@ class PermintaanPenjemputan extends Model
     public function statusTerkini()
     {
         return $this->hasOne(StatusPenjemputan::class, 'permintaan_id')
-            ->latest('tanggal_status')
-            ->latest('created_at');
+                    ->latestOfMany();
     }
 
     // Relasi ke detail rute

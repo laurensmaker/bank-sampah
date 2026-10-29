@@ -12,10 +12,7 @@ return new class extends Migration
     public function up(): void
     {
         Schema::create('armada', function (Blueprint $table) {
-            $table->id();
-            $table->foreignId('id_optimasirute')->nullable()
-                ->constrained('optimasirute')
-                ->cascadeOnDelete();
+           $table->id();
             $table->string('nama_armada');
             $table->string('email')->unique();
             $table->string('jenis_kendaraan');
@@ -24,6 +21,7 @@ return new class extends Migration
             $table->double('latitude_depot', 10, 7)->default(0);
             $table->double('longitude_depot', 10, 7)->default(0);
             $table->timestamps();
+        
         });
     }
 

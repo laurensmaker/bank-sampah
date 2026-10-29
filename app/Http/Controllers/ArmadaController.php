@@ -7,8 +7,7 @@ use App\Models\DetailRute;
 use App\Models\OptimasiRute;
 use App\Models\PermintaanPenjemputan;
 use App\Models\StatusPenjemputan;
-use App\Services\MTSPService;
-use App\Services\NearestNeighborService;
+use App\Services\PenjemputanService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -16,121 +15,191 @@ use Illuminate\Support\Facades\Log;
 
 class ArmadaController extends Controller
 {
-    protected $nn;
-    protected $mtsp;
+    protected PenjemputanService $service;
 
-    public function __construct(NearestNeighborService $nn, MTSPService $mtsp)
+    public function __construct(PenjemputanService $service)
     {
-        $this->nn = $nn;
-        $this->mtsp = $mtsp;
+        $this->service = $service;
     }
 
     /**
-     * Dashboard Armada
+     * Dashboard armada
      */
-    /**
- * Dashboard Armada
- */
-   public function index()
+    public function index()
     {
+        // 1. Ambil user yang sedang login
+        $user = Auth::user();
+        
+        // 2. Cari data armada
+        $armada = Armada::where('email', $user->email)->first();
+
+        // 3. PENGAMAN: Jika armada tidak ditemukan, logout dan kembalikan ke login
+        if (!$armada) {
+            Auth::logout();
+            return redirect()->route('login')->withErrors(['email' => 'Data armada tidak ditemukan di sistem.']);
+        }
+
         try {
-            $user = Auth::user();
-            $armada = Armada::where('email', $user->email)->first();
-
-            if (!$armada) {
-                return redirect()->route('login')->with('error', 'Data armada tidak ditemukan.');
-            }
-
-            // Cari optimasi hari ini
+            // ✅ Cari optimasi TERBARU hari ini
             $optimasiHariIni = OptimasiRute::whereDate('tanggal', now()->toDateString())
-                ->whereHas('detailRute', function ($q) use ($armada) {
-                    $q->where('id_armada', $armada->id);
-                })
+                ->orderByDesc('id')
                 ->first();
 
+            // ✅ Deklarasi variabel default (PENTING: agar tidak undefined jika tidak ada optimasi)
             $tugas = collect();
+            $tugasAktif = collect();
+            $tugasSelesai = collect();
             $totalTugas = 0;
             $totalSelesai = 0;
             $totalJarak = 0;
             $optimasiAktif = false;
             $kapasitasTerpakai = 0;
             $sisaKapasitas = 0;
+            $isPrioritas = false;
+            $armadaPrioritas = null;
 
             if ($optimasiHariIni) {
-                $tugas = DetailRute::with([
-                    'permintaan',
-                    'permintaan.nasabah',
-                    'permintaan.statusTerkini'
-                ])
-                ->where('id_optimasi', $optimasiHariIni->id)
-                ->where('id_armada', $armada->id)
-                ->orderBy('urutan', 'asc')
-                ->get();
+                // ✅ Ambil SEMUA tugas armada ini HARI INI
+                $semuaTugas = DetailRute::with(['permintaan.nasabah', 'permintaan.statusTerkini'])
+                    ->whereHas('optimasiRute', function ($q) {
+                        $q->whereDate('tanggal', now()->toDateString());
+                    })
+                    ->where('id_armada', $armada->id)
+                    ->orderBy('id_optimasi', 'asc')
+                    ->orderBy('urutan', 'asc')
+                    ->get();
 
-                $totalTugas = $tugas->count();
-                $totalSelesai = $tugas->filter(function ($item) {
-                    return $item->permintaan->statusTerkini && 
-                        $item->permintaan->statusTerkini->status === 'Selesai';
-                })->count();
-                $totalJarak = $tugas->sum('total_jarak');
-                $optimasiAktif = true;
-                
-                // ✅ HITUNG KAPASITAS
-                $kapasitasTerpakai = $tugas->sum(function ($item) {
-                    return $item->permintaan->berat_sampah ?? 0;
-                });
-                $sisaKapasitas = ($armada->kapasitas ?? 25) - $kapasitasTerpakai;
-                
-                Log::info('Armada ' . $armada->nama_armada . ' - Kapasitas terpakai: ' . $kapasitasTerpakai . ' kg, Sisa: ' . $sisaKapasitas . ' kg');
+                // ✅ PISAHKAN: aktif vs selesai
+                $tugasAktif = $semuaTugas->filter(function ($t) {
+                    $status = optional($t->permintaan->statusTerkini)->status;
+                    return !in_array($status, ['Selesai', 'Dibatalkan']);
+                })->values();
+
+                $tugasSelesai = $semuaTugas->filter(function ($t) {
+                    $status = optional($t->permintaan->statusTerkini)->status;
+                    return in_array($status, ['Selesai', 'Dibatalkan']);
+                })->values();
+
+                // ✅ $tugas = semua (untuk backward compat)
+                $tugas = $semuaTugas;
+
+                $totalTugas = $semuaTugas->count();
+                $totalSelesai = $tugasSelesai->count();
+                $totalJarak = $semuaTugas->sum('jarak');
+                $optimasiAktif = $tugasAktif->count() > 0;
+
+                // Kapasitas terpakai = hanya yang BELUM selesai
+                $kapasitasTerpakai = $tugasAktif->sum(fn ($t) => $t->permintaan->berat_sampah ?? 0);
+                $sisaKapasitas = max(0, ($armada->kapasitas ?? 25) - $kapasitasTerpakai);
+
+                // Prioritas
+                $isPrioritas = (int) $optimasiHariIni->id_armada_prioritas === (int) $armada->id;
+                $armadaPrioritas = $optimasiHariIni->id_armada_prioritas
+                    ? Armada::find($optimasiHariIni->id_armada_prioritas)
+                    : null;
             }
 
-            // ✅ CEK PERMINTAAN YANG DIJADWALKAN BESOK
             $permintaanBesok = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
                 $q->where('status', 'Menunggu')
-                ->whereDate('tanggal_status', '>', now()->toDateString());
+                  ->whereDate('tanggal_status', '>', now()->toDateString());
             })->count();
 
-            // Cek apakah ada permintaan menunggu untuk hari ini
-            $adaPermintaanMenunggu = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
+            $detailPermintaanBesok = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
                 $q->where('status', 'Menunggu')
-                ->whereDate('tanggal_status', '<=', now()->toDateString());
-            })->exists();
+                ->whereDate('tanggal_status', '>', now()->toDateString());
+            })
+            ->with(['nasabah', 'statusTerkini'])
+            ->orderBy('id', 'asc')
+            ->get();
+
+            // ✅ Cek apakah ada permintaan "Menunggu" yang BELUM dioptimasi
+            $permintaanMenungguBelumDiproses = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
+                $q->where('status', 'Menunggu')
+                ->whereDate('tanggal_status', '<=', now()->toDateString()); // ✅ Tambah filter ini
+            })
+            ->whereNull('id_optimasirute')
+            ->count();;
+
+            // ✅ Tombol optimasi muncul jika ada permintaan baru
+            $adaPermintaanMenunggu = $permintaanMenungguBelumDiproses > 0;
 
             return view('frontend.armada.dasbor', compact(
-                'armada',
-                'tugas',
-                'totalTugas',
-                'totalSelesai',
-                'totalJarak',
-                'optimasiAktif',
-                'optimasiHariIni',
-                'adaPermintaanMenunggu',
-                'kapasitasTerpakai',
-                'sisaKapasitas',
-                'permintaanBesok'
+                'armada', 'tugas', 'tugasAktif', 'tugasSelesai', 'totalTugas', 'totalSelesai', 'totalJarak',
+                'optimasiAktif', 'optimasiHariIni', 'adaPermintaanMenunggu',
+                'kapasitasTerpakai', 'sisaKapasitas', 'permintaanBesok',
+                'isPrioritas', 'armadaPrioritas',
+                'permintaanMenungguBelumDiproses', 'detailPermintaanBesok'
             ));
 
         } catch (\Exception $e) {
-            Log::error('Error ArmadaController@index: ' . $e->getMessage());
-            return view('frontend.armada.dasbor', [
-                'armada' => Armada::where('email', Auth::user()->email)->first(),
-                'tugas' => collect(),
-                'totalTugas' => 0,
-                'totalSelesai' => 0,
-                'totalJarak' => 0,
-                'optimasiAktif' => false,
-                'optimasiHariIni' => null,
-                'adaPermintaanMenunggu' => false,
-                'kapasitasTerpakai' => 0,
-                'sisaKapasitas' => 0,
-                'permintaanBesok' => 0
-            ]);
+            // Tampilkan error jika ada masalah database (Hapus dd() jika sudah production)
+            dd('Error di Dasbor Armada: ' . $e->getMessage(), $e->getFile(), $e->getLine());
+        }
+    }
+    /**
+     * ✅ PROSES OPTIMASI — bisa dijalankan BERKALI-KALI per hari
+     *    selama masih ada permintaan "Menunggu" yang belum diproses
+     */
+    public function optimasiProses()
+    {
+        try {
+            Log::info('=== OPTIMASI PROSES DIPANGGIL ===');
+
+            // Ambil armada yang LOGIN
+            $user = Auth::user();
+            $armadaLogin = Armada::where('email', $user->email)->first();
+
+            if (!$armadaLogin) {
+                return redirect()->route('armada.dasbor')
+                    ->with('error', 'Data armada tidak ditemukan.');
+            }
+
+            // ✅ PERUBAHAN KUNCI:
+            // Cek apakah ada permintaan "Menunggu" yang BELUM dioptimasi
+            $permintaanBaru = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
+                    $q->where('status', 'Menunggu')
+                    ->whereDate('tanggal_status', '<=', now()->toDateString()); // ✅ Tambah filter ini
+                })
+                ->whereNull('id_optimasirute')
+                ->count();
+
+            if ($permintaanBaru === 0) {
+                return redirect()->route('armada.dasbor')
+                    ->with('warning', 'Tidak ada permintaan baru untuk hari ini yang perlu dioptimasi. '
+                        . 'Permintaan untuk besok tidak akan ditarik ke hari ini.');
+            }
+
+            Log::info('Jumlah permintaan baru: ' . $permintaanBaru);
+
+            // Cek minimal 2 armada aktif
+            $armadaCount = Armada::where('status_armada', 'Aktif')->count();
+            if ($armadaCount < 2) {
+                return redirect()->route('armada.dasbor')
+                    ->with('error', 'Minimal diperlukan 2 armada aktif.');
+            }
+
+            // ✅ Panggil service — armada login = prioritas
+            $hasil = $this->service->proses($armadaLogin);
+
+            if (!$hasil || !$hasil->optimasi) {
+                return redirect()->route('armada.dasbor')
+                    ->with('warning', $hasil->pesan ?? 'Tidak ada permintaan yang diproses.');
+            }
+
+            $jumlahBaru = $hasil->optimasi->jumlah_permintaan;
+
+            return redirect()->route('armada.rute')
+                ->with('success', $jumlahBaru . ' permintaan baru berhasil dioptimasi! '
+                    . 'Anda adalah armada prioritas. '
+                    . ($hasil->pesan ?? ''));
+
+        } catch (\Exception $e) {
+            Log::error('Error optimasi proses: ' . $e->getMessage());
+            return redirect()->route('armada.dasbor')
+                ->with('error', 'Gagal: ' . $e->getMessage());
         }
     }
 
-    /**
-     * ✅ TAMPILAN RUTE DI GOOGLE MAPS
-     */
     public function rute()
     {
         try {
@@ -141,11 +210,9 @@ class ArmadaController extends Controller
                 return redirect()->route('login')->with('error', 'Data armada tidak ditemukan.');
             }
 
-            // Cari optimasi hari ini
             $optimasi = OptimasiRute::whereDate('tanggal', now()->toDateString())
-                ->whereHas('detailRute', function ($q) use ($armada) {
-                    $q->where('id_armada', $armada->id);
-                })
+                ->whereHas('detailRute', fn ($q) => $q->where('id_armada', $armada->id))
+                ->orderByDesc('id')
                 ->first();
 
             if (!$optimasi) {
@@ -153,178 +220,62 @@ class ArmadaController extends Controller
                     ->with('error', 'Belum ada rute penjemputan untuk hari ini.');
             }
 
-            // Ambil detail rute untuk armada ini
-            $tugas = DetailRute::with([
-                'permintaan',
-                'permintaan.nasabah',
-                'permintaan.statusTerkini'
-            ])
-            ->where('id_optimasi', $optimasi->id)
-            ->where('id_armada', $armada->id)
-            ->orderBy('urutan', 'asc')
-            ->get();
+            // ✅ Ambil SEMUA tugas hari ini
+            $semuaTugas = DetailRute::with(['permintaan.nasabah', 'permintaan.statusTerkini'])
+                ->whereHas('optimasiRute', function ($q) {
+                    $q->whereDate('tanggal', now()->toDateString());
+                })
+                ->where('id_armada', $armada->id)
+                ->orderBy('urutan', 'asc')
+                ->orderBy('id_optimasi', 'asc')                
+                ->get();
+
+            // ✅ Filter: hanya yang BELUM selesai/dibatalkan untuk peta
+            $tugas = $semuaTugas->filter(function ($t) {
+                $status = optional($t->permintaan->statusTerkini)->status;
+                return !in_array($status, ['Selesai', 'Dibatalkan']);
+            })->sortBy('urutan')->values();
 
             if ($tugas->isEmpty()) {
                 return redirect()->route('armada.dasbor')
-                    ->with('error', 'Tidak ada tugas penjemputan untuk hari ini.');
+                    ->with('info', 'Semua tugas hari ini sudah selesai! 🎉');
             }
 
-            // Format data untuk Google Maps
             $points = $this->formatPointsForMap($armada, $tugas);
 
             return view('frontend.armada.rute', compact('armada', 'tugas', 'optimasi', 'points'));
 
         } catch (\Exception $e) {
             Log::error('Error ArmadaController@rute: ' . $e->getMessage());
-            return redirect()->route('armada.dasbor')
-                ->with('error', 'Gagal menampilkan rute: ' . $e->getMessage());
+            return redirect()->route('armada.dasbor')->with('error', 'Gagal: ' . $e->getMessage());
         }
     }
 
     /**
-     * ✅ PROSES OPTIMASI VIA GET (Redirect)
-     */
-    public function optimasiProses()
-    {
-        try {
-            Log::info('=== OPTIMASI PROSES VIA GET DIPANGGIL ===');
-            
-            // Cek apakah ada permintaan menunggu
-            $adaPermintaan = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
-                $q->where('status', 'Menunggu');
-            })->exists();
-
-            if (!$adaPermintaan) {
-                return redirect()->route('armada.dasbor')
-                    ->with('error', 'Tidak ada permintaan dengan status Menunggu.');
-            }
-
-            // Cek armada aktif
-            $armadaCount = Armada::where('status_armada', 'Aktif')->count();
-            if ($armadaCount < 2) {
-                return redirect()->route('armada.dasbor')
-                    ->with('error', 'Minimal diperlukan 2 armada aktif.');
-            }
-
-            DB::beginTransaction();
-
-            // 1. Proses MTSP
-            $result = $this->mtsp->proses();
-            
-            if (!$result || !isset($result->optimasi)) {
-                throw new \Exception('Gagal memproses MTSP.');
-            }
-
-            // 2. Proses Nearest Neighbor
-            $this->nn->proses($result->optimasi->id);
-
-            DB::commit();
-
-            return redirect()->route('armada.rute')
-                ->with('success', $result->pesan ?? 'Optimasi berhasil!');
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error('Error optimasi proses: ' . $e->getMessage());
-            return redirect()->route('armada.dasbor')
-                ->with('error', 'Gagal: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * ✅ PROSES OPTIMASI VIA AJAX (untuk tombol dengan SweetAlert)
-     */
-    public function optimasiRute()
-    {
-        try {
-            Log::info('=== OPTIMASI RUTE VIA AJAX DIPANGGIL ===');
-            
-            $adaPermintaan = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
-                $q->where('status', 'Menunggu');
-            })->exists();
-
-            if (!$adaPermintaan) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Tidak ada permintaan dengan status Menunggu.'
-                ]);
-            }
-
-            $armadaCount = Armada::where('status_armada', 'Aktif')->count();
-            if ($armadaCount < 2) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Minimal diperlukan 2 armada aktif.'
-                ]);
-            }
-
-            DB::beginTransaction();
-
-            $result = $this->mtsp->proses();
-            
-            if (!$result || !isset($result->optimasi)) {
-                throw new \Exception('Gagal memproses MTSP.');
-            }
-
-            $this->nn->proses($result->optimasi->id);
-
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => $result->pesan ?? 'Optimasi berhasil!',
-                'redirect' => route('armada.rute'),
-                'data' => [
-                    'optimasi_id' => $result->optimasi->id,
-                    'jumlah_permintaan' => $result->optimasi->jumlah_permintaan,
-                    'jumlah_armada' => $result->optimasi->jumlah_armada,
-                    'total_berat' => $result->optimasi->total_berat
-                ]
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error('Error optimasi: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Gagal: ' . $e->getMessage()
-            ]);
-        }
-    }
-
-    /**
-     * ✅ UPDATE STATUS MENJADI SELESAI
+     * Update status menjadi Selesai
      */
     public function selesai($idPermintaan)
     {
         DB::beginTransaction();
-
         try {
             $user = Auth::user();
             $armada = Armada::where('email', $user->email)->first();
-            
-            if (!$armada) {
-                throw new \Exception('Data armada tidak ditemukan.');
-            }
+
+            if (!$armada) throw new \Exception('Data armada tidak ditemukan.');
 
             $permintaan = PermintaanPenjemputan::findOrFail($idPermintaan);
-            
-            // Cek apakah permintaan milik armada ini
+
             $detailRute = DetailRute::where('id_permintaan', $idPermintaan)
                 ->where('id_armada', $armada->id)
                 ->first();
 
-            if (!$detailRute) {
-                throw new \Exception('Permintaan tidak ditemukan atau bukan milik armada Anda.');
-            }
+            if (!$detailRute) throw new \Exception('Permintaan bukan milik armada Anda.');
 
-            // Cek status terkini
             $statusTerkini = $permintaan->statusTerkini;
             if ($statusTerkini && $statusTerkini->status === 'Selesai') {
                 throw new \Exception('Permintaan ini sudah selesai.');
             }
 
-            // Update status menjadi Selesai
             StatusPenjemputan::create([
                 'permintaan_id'  => $idPermintaan,
                 'status'         => 'Selesai',
@@ -333,8 +284,7 @@ class ArmadaController extends Controller
             ]);
 
             DB::commit();
-
-            return redirect()->back()->with('success', 'Status penjemputan berhasil diupdate menjadi Selesai.');
+            return redirect()->back()->with('success', 'Status penjemputan selesai.');
 
         } catch (\Exception $e) {
             DB::rollBack();
@@ -343,28 +293,25 @@ class ArmadaController extends Controller
         }
     }
 
-    /**
-     * ✅ FORMAT DATA UNTUK GOOGLE MAPS
-     */
     private function formatPointsForMap($armada, $tugas)
     {
         $points = [
             'depot' => [
                 'lat' => (float) $armada->latitude_depot,
-                'lng' => (float) $armada->longitude_depot
+                'lng' => (float) $armada->longitude_depot,
             ],
-            'tujuan' => []
+            'tujuan' => [],
         ];
 
         foreach ($tugas as $item) {
             $points['tujuan'][] = [
-                'lat' => (float) $item->permintaan->latitude,
-                'lng' => (float) $item->permintaan->longitude,
-                'nama' => $item->permintaan->nasabah->nama_nasabah ?? 'Nasabah',
-                'alamat' => $item->permintaan->alamat_penjemputan,
-                'urutan' => $item->urutan,
-                'berat' => $item->permintaan->berat_sampah,
-                'jenis_sampah' => $item->permintaan->jenis_sampah
+                'lat'          => (float) $item->permintaan->latitude,
+                'lng'          => (float) $item->permintaan->longitude,
+                'nama'         => $item->permintaan->nasabah->nama_nasabah ?? 'Nasabah',
+                'alamat'       => $item->permintaan->alamat_penjemputan,
+                'urutan'       => $item->urutan,
+                'berat'        => $item->permintaan->berat_sampah,
+                'jenis_sampah' => $item->permintaan->jenis_sampah,
             ];
         }
 

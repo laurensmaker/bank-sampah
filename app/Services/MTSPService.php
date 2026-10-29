@@ -12,14 +12,19 @@ use Illuminate\Support\Facades\Log;
 
 class MTSPService
 {
+    // Kapasitas maksimal per armada per hari (kg)
     protected $kapasitasHarian = 25;
 
-    public function proses()
+    /**
+     * Proses pembagian. $prioritasArmadaId = id armada yang men-trigger optimasi (optional)
+     */
+    public function proses($prioritasArmadaId = null)
     {
         DB::beginTransaction();
 
         try {
             Log::info('=== MTSPService: Memulai Proses ===');
+            Log::info('Prioritas Armada ID: ' . ($prioritasArmadaId ?? 'null'));
 
             // STEP 1: Buat header optimasi
             $optimasi = OptimasiRute::create([
@@ -46,7 +51,6 @@ class MTSPService
             }
 
             // STEP 4: Ambil permintaan dengan status TERKINI "Menunggu"
-            // PENTING: pastikan hanya ambil status TERBARU per permintaan
             $permintaan = PermintaanPenjemputan::whereHas('statusTerkini', function ($q) {
                 $q->where('status', 'Menunggu');
             })
@@ -69,21 +73,21 @@ class MTSPService
             $armada1 = $armadas[0];
             $armada2 = $armadas[1];
 
-            // ✅ AMBIL KAPASITAS DARI DATABASE (validasi: minimal 1)
-            $kapasitasArmada1 = max(1, (float) ($armada1->kapasitas ?? $this->kapasitasHarian));
-            $kapasitasArmada2 = max(1, (float) ($armada2->kapasitas ?? $this->kapasitasHarian));
+            // Ambil kapasitas dari DB tetapi batasi ke kapasitas harian maksimum
+            $kapasitasArmada1 = min($this->kapasitasHarian, max(1, (float) ($armada1->kapasitas ?? $this->kapasitasHarian)));
+            $kapasitasArmada2 = min($this->kapasitasHarian, max(1, (float) ($armada2->kapasitas ?? $this->kapasitasHarian)));
 
             $kapasitasAwal1 = $kapasitasArmada1;
             $kapasitasAwal2 = $kapasitasArmada2;
 
-            Log::info('Kapasitas Armada 1 (' . $armada1->nama_armada . '): ' . $kapasitasArmada1 . ' kg');
-            Log::info('Kapasitas Armada 2 (' . $armada2->nama_armada . '): ' . $kapasitasArmada2 . ' kg');
+            Log::info('Kapasitas Armada 1 (' . $armada1->nama_armada . '): ' . $kapasitasArmada1 . ' kg (max per hari: ' . $this->kapasitasHarian . ' kg)');
+            Log::info('Kapasitas Armada 2 (' . $armada2->nama_armada . '): ' . $kapasitasArmada2 . ' kg (max per hari: ' . $this->kapasitasHarian . ' kg)');
 
             $permintaanBesok = [];
             $totalBeratTerbagi = 0;
             $jumlahTerbagi = 0;
 
-            // ✅ PENTING: sortByDesc HARUS di-reset index-nya
+            // Reset index setelah sortByDesc
             $permintaanSorted = $permintaan->sortByDesc('berat_sampah')->values();
 
             foreach ($permintaanSorted as $index => $item) {
@@ -93,13 +97,14 @@ class MTSPService
                 Log::info('  Berat: ' . $berat . ' kg');
                 Log::info('  Sisa Armada 1: ' . $kapasitasArmada1 . ' kg | Sisa Armada 2: ' . $kapasitasArmada2 . ' kg');
 
-                // Skip jika berat melebihi kapasitas maksimum
-                if ($berat > max($kapasitasAwal1, $kapasitasAwal2)) {
-                    Log::warning('  ❌ Berat melebihi kapasitas maksimum, dijadwalkan besok');
+                // Jika satu permintaan lebih besar dari kapasitas maksimal per hari, jadwalkan besok
+                if ($berat > $this->kapasitasHarian) {
+                    Log::warning('  ❌ Berat melebihi kapasitas maksimum per hari (' . $this->kapasitasHarian . ' kg), dijadwalkan besok');
                     $permintaanBesok[] = $item;
                     continue;
                 }
 
+                // Hitung jarak dari depot masing-masing armada
                 $jarakArmada1 = $this->haversine(
                     $armada1->latitude_depot, $armada1->longitude_depot,
                     $item->latitude, $item->longitude
@@ -114,9 +119,31 @@ class MTSPService
 
                 $armadaTerpilih = null;
 
+                // Tentukan armada prioritas dari parameter
+                $prioritas = null;
+                if ($prioritasArmadaId !== null) {
+                    if ((int) $prioritasArmadaId === (int) $armada1->id) {
+                        $prioritas = $armada1;
+                    } elseif ((int) $prioritasArmadaId === (int) $armada2->id) {
+                        $prioritas = $armada2;
+                    }
+                }
+
                 if ($cukup1 && $cukup2) {
-                    // Pilih yang terdekat
-                    $armadaTerpilih = $jarakArmada1 <= $jarakArmada2 ? $armada1 : $armada2;
+                    // Jika ada prioritas dan prioritas termasuk armada saat ini dan punya kapasitas -> pilih prioritas
+                    if ($prioritas !== null) {
+                        if ((int) $prioritas->id === (int) $armada1->id && $cukup1) {
+                            $armadaTerpilih = $armada1;
+                        } elseif ((int) $prioritas->id === (int) $armada2->id && $cukup2) {
+                            $armadaTerpilih = $armada2;
+                        } else {
+                            // Prioritas tidak punya kapasitas, fallback ke jarak
+                            $armadaTerpilih = $jarakArmada1 <= $jarakArmada2 ? $armada1 : $armada2;
+                        }
+                    } else {
+                        // Tidak ada prioritas -> pakai jarak terdekat
+                        $armadaTerpilih = $jarakArmada1 <= $jarakArmada2 ? $armada1 : $armada2;
+                    }
                 } elseif ($cukup1) {
                     $armadaTerpilih = $armada1;
                 } elseif ($cukup2) {
@@ -124,12 +151,12 @@ class MTSPService
                 }
 
                 if (!$armadaTerpilih) {
-                    Log::info('  ⏳ Kedua armada tidak cukup, dijadwalkan besok');
+                    Log::info('  ⏳ Kedua armada tidak cukup sisa kapasitas untuk permintaan ini, dijadwalkan besok');
                     $permintaanBesok[] = $item;
                     continue;
                 }
 
-                // ✅ SIMPAN KE DETAIL RUTE
+                // SIMPAN KE DETAIL RUTE
                 DetailRute::create([
                     'id_optimasi'    => $optimasi->id,
                     'id_armada'      => $armadaTerpilih->id,
@@ -140,11 +167,13 @@ class MTSPService
                     'estimasi_waktu' => 0,
                 ]);
 
-                // ✅ KURANGI KAPASITAS — gunakan perbandingan ID yang aman
+                // KURANGI KAPASITAS — gunakan perbandingan ID yang aman
                 if ((int) $armadaTerpilih->id === (int) $armada1->id) {
                     $kapasitasArmada1 -= $berat;
+                    $kapasitasArmada1 = max(0, $kapasitasArmada1);
                 } else {
                     $kapasitasArmada2 -= $berat;
+                    $kapasitasArmada2 = max(0, $kapasitasArmada2);
                 }
 
                 StatusPenjemputan::create([
@@ -181,7 +210,7 @@ class MTSPService
                 'optimasi' => $optimasi,
                 'jumlahDitunda' => count($permintaanBesok),
                 'pesan' => count($permintaanBesok) > 0
-                    ? count($permintaanBesok) . ' permintaan dijadwalkan besok karena kapasitas armada penuh.'
+                    ? count($permintaanBesok) . ' permintaan dijadwalkan besok karena kapasitas armada penuh atau permintaan terlalu besar.'
                     : 'Semua permintaan berhasil dibagi.'
             ];
 

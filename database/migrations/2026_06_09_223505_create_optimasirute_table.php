@@ -12,16 +12,20 @@ return new class extends Migration
     public function up(): void
     {
         Schema::create('optimasirute', function (Blueprint $table) {
-            $table->id();
-             $table->date('tanggal');
+              $table->id();
+            $table->date('tanggal')->index();
+            $table->foreignId('id_armada_prioritas')
+                ->constrained('armada')
+                ->cascadeOnDelete();
             $table->string('metode_pembagian')->default('MTSP');
             $table->string('metode_rute')->default('Nearest Neighbor');
             $table->unsignedInteger('jumlah_permintaan')->default(0);
             $table->unsignedInteger('jumlah_armada')->default(0);
             $table->decimal('total_berat', 8, 2)->default(0);
             $table->decimal('total_jarak', 10, 2)->default(0);
-            $table->unsignedInteger('total_waktu')->default(0);
+            $table->unsignedInteger('total_waktu')->default(0);            
             $table->timestamps();
+            $table->index(['tanggal', 'id_armada_prioritas'], 'idx_tanggal_prioritas');
         });
     }
 

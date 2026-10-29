@@ -21,6 +21,18 @@ class DatabaseSeeder extends Seeder
     {
         $users = [
             [
+                'name' => 'markus',
+                'email' => 'armada1@bank.com',
+                'password' => bcrypt('armada123'),
+                'role' => 'armada',
+            ],
+            [
+                'name' => 'henry',
+                'email' => 'armada2@bank.com',
+                'password' => bcrypt('armada123'),
+                'role' => 'armada',
+            ],
+            [
                 'name' => 'Yanto',
                 'email' => 'yanto@gmail.com',
                 'password' => bcrypt('yanto123'),
@@ -80,18 +92,7 @@ class DatabaseSeeder extends Seeder
                 'password' => bcrypt('mas123'),
                 'role' => 'nasabah',
             ],
-            [
-                'name' => 'markus',
-                'email' => 'armada1@bank.com',
-                'password' => bcrypt('armada123'),
-                'role' => 'armada',
-            ],
-            [
-                'name' => 'henry',
-                'email' => 'armada2@bank.com',
-                'password' => bcrypt('armada123'),
-                'role' => 'armada',
-            ],
+            
         ];
 
         foreach ($users as $user) {
